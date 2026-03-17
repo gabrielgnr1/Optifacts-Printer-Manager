@@ -342,6 +342,41 @@ printer_manager.pl -redo
 
 ---
 
+## Internal Design Notes
+
+### Self-Re-Execution Mechanism
+
+`printer_manager.pl` re-executes itself once on startup. This is intentional and not a bug.
+
+Perl compiles `use` statements (like `use DBI`) before any runtime code runs. This means environment variables such as `LD_LIBRARY_PATH` must already be set before the script starts, otherwise the Informix driver (`DBD::Informix`) fails to load.
+
+To solve this, the script uses a control variable (`$ENV{PERL_ENV_IS_CONFIGURED}`):
+
+1. On the **first run**: the variable is not set. The script sets all Informix environment variables, then calls `exec()` to restart itself as a new process that inherits the correct environment.
+2. On the **second run**: the variable is set. The script skips the setup block and proceeds normally with `use DBI` now able to load.
+
+If you see the process appear twice in logs or process monitors, this is expected behavior.
+
+---
+
+### Directory Fallback Logic
+
+When `printer_manager.pl` starts, it evaluates `$working_directory` in two steps:
+
+**If the directory does not exist:**
+- The script attempts to create it.
+- If creation fails, it falls back to `/tmp/printer_manager_fallback/` for all logs and subdirectories.
+- If the fallback also cannot be created, the script exits with fatal error `F20`.
+
+**If the directory exists but is not writable (hybrid fallback):**
+- The script checks if `$config_file` is readable.
+  - If **yes**: uses the real config file for routing rules, but redirects all logs and subdirectories to `/tmp/printer_manager_fallback/`.
+  - If **no**: fatal error `F21`. The script logs to the fallback path and exits.
+
+This means the system can still route files correctly even if the working directory has permission issues, as long as the config file is accessible.
+
+---
+
 ## Directory Structure
 
 All directories are created automatically under `$working_directory` if they do not exist. If `$working_directory` itself is unwritable, the script falls back to a temporary directory under `/tmp/`.
