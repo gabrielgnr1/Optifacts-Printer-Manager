@@ -1,0 +1,545 @@
+################################################################################
+#                                printer_manager.pl
+#      	Manage Optifacts Printer Rules, if called by `intercept_ps2pdf.pl`.
+################################################################################
+#
+#	MODIFICATION HISTORY:
+#
+#   YYYY-MM-DD		PERSON				DESCRIPTION
+#   2025-07-24		Gabriel Ramalho		First version.
+#
+#===============================================================================
+#              SECTION 1: PROGRAM CONTEXT, FUNCTIONALITY, AND AIM
+#===============================================================================
+
+###	1.1. PURPOSE AND SCOPE
+
+# 	The script's core objective is to determine the correct destination for a
+# 	given file (`.ps` or `.pdf`) by querying a database, matching the result
+# 	against a local configuration file, and then executing the appropriate
+# 	action—either moving the file to a directory or sending it to a system printer.
+#   This script is a command-line utility with multiple operational modes.
+
+###	1.2. WORKFLOW INTEGRATION AND CONTEXT
+
+# 	This script is to coexists with the standard Optifacts printing system.
+#	It is critical to understand that this special workflow is only triggered for jobs
+#	destined for PDF output and does not alter existing non-PDF printing processes.
+#	
+#	- Standard Workflow Unaffected: All existing PHYSICAL printer definitions and rules
+#	  in Optifacts (e.g., in menus 3-5, and 3-11-14-2 rules like "PRINTERPCX" or
+#	  "PRINTERLAX") will continue to function normally without any impact from this script.
+#
+#   - Special PDF Workflow Trigger: This new workflow is triggered ONLY when an Optifacts
+#	  job destination evaluates to a PDF output queue AND the variable `PS2PDF=` parameter of
+#	  the `/u/optifacts/printer.dbs/PS_Printers.cfg` file is modified to point to the 
+#	  `intercept_ps2pdf.pl` script.
+#	  (Optifacts will follow the standard behavior if `PS2PDF=` is kept as `/usr/bin/ps2pdf`)
+#
+#	- The full execution chain is as follows:
+#		1. A print job is initiated through an Optifacts printer queue configured for PDF output.
+#		2. The printing system executes the primary program for that queue: `/u/optifacts/bin/pr_LayHtm`.
+#		3. The `pr_LayHtm` program generates a temporary PostScript file.
+#		4. `pr_LayHtm` calls `intercept_ps2pdf.pl`, which handles file naming, PDF
+#		   conversion, and multi-destination copying.
+#		5. `intercept_ps2pdf.pl` then calls THIS SCRIPT (`printer_manager.pl`) as an
+#		   external program, passing the full path to a newly created file as a
+#		   single command-line argument. This script then takes over to perform the final routing.
+
+#===============================================================================
+#                   SECTION 2: SETUP INSTRUCTIONS
+#===============================================================================
+
+# 	1. DEPENDENCIES (PRE-REQUISITES)
+#	   The following components are MANDATORY for this script to run. It is essential
+#	   to ensure they are installed and accessible before deployment.
+#
+#	   A) PERL MODULES:
+#		  - File::Copy
+#		  - File::Basename
+#		  - Sys::Syslog
+#		  - File::Path
+#		  - Fcntl
+#		  - DBI
+#		  - Test::Pod
+#		  - DBD::Informix
+#	      Installation Notice: These modules must be installed on the system. They can
+#	      typically be installed via the system's package manager or CPAN. As a user
+#	      with appropriate permissions, the CPAN command is: `cpan Module::Name`
+#	      (e.g., `cpan DBI`, `cpan DBD::Informix`).
+#	      Startup Check: The script will check for these modules at startup. If any
+#	      are missing, it will log a fatal error to the `$failure_log` (F1) and exit.
+#	
+#	    - Sequence to install base Perl modules:
+#		    sudo cpanm File::Copy
+#		    sudo cpanm File::Basename
+#		    sudo cpanm Sys::Syslog
+#		    sudo cpanm File::Path
+#	
+#	    - Sequence to install Informix Specific Perl Modules.
+#	      Modify the export variables to match your environment context.
+#		    sudo cpanm DBI
+#		    sudo cpanm Test::Pod
+#		    sudo su root
+#			    export INFORMIXDIR="/usr/ids"
+#			    export PATH="/usr/ids/bin:${PATH}"
+#			    export LD_LIBRARY_PATH="/usr/informix/lib:/usr/informix/lib/esql:/usr/ids/lib:/usr/ids/lib/esql:${LD_LIBRARY_PATH}"
+#			    export INFORMIXSERVER="informix_server_name"
+#			    export INFORMIXSQLHOSTS="/usr/informix/etc/sqlhosts.01"
+#			    export ONCONFIG="onconfig.01"
+#			    export DBD_INFORMIX_DATABASE="optifacts"
+#			    export DBD_INFORMIX_USERNAME="user_credential"
+#			    export DBD_INFORMIX_PASSWORD="user_credential"
+#			    cpanm DBD::Informix
+#
+#	   B) EXTERNAL PROGRAMS:
+#	      The command specified in `$printer_check_command` (e.g., `lpstat`) must
+#	      be installed and available in the execution environment's PATH.
+#
+#	   C) DATABASE:
+#	      A running Informix instance with the specified stored procedure.
+	
+# 	2. PLACEMENT
+#	   Place this script in a standard executable path, such as /usr/local/bin/printer_manager.pl
+#	   Make sure it is executable by all users: `chmod 755 /usr/local/bin/printer_manager.pl`
+
+# 	3. SCRIPT CONFIGURATION
+#	   Modify the "CONFIGURATION VARIABLES" section (Section 4) below to match your
+#	   environment's needs (e.g., working directory, database credentials).
+
+# 	4. INTEGRATION WITH PRECEDING SCRIPT
+#	   This script is triggered by `intercept_ps2pdf.pl`. To enable this, you must
+#	   edit the configuration section of `intercept_ps2pdf.pl` and set the `$CALL_EXEC_PS`
+#	   and/or `$CALL_EXEC_PDF` variables to the full path of this script. For example:
+#	   `my $CALL_EXEC_PDF = "/usr/local/bin/printer_manager.pl";`
+
+# 	5. DIRECTORY PERMISSIONS (CRITICAL)
+#	   The system's printing service runs as a low-privilege user (often 'lp' on
+#	   Linux systems). This user MUST have write permissions for the main `$working_directory`
+#	   and all subdirectories the script will manage.
+#	   Example command to grant permissions: `chmod -R o+w /path/to/your/working_directory`
+#	   This version is designed to operate with a self-contained directory structure.
+
+# 	6. LOGGING OVERVIEW
+#	   - Successful jobs are logged to the file specified in `$success_log`.
+#	   - All operational and critical errors are logged to the `$failure_log`.
+#	   - If verbose mode is on, detailed step-by-step diagnostics are logged to `$verbose_log`.
+#	   - If the primary working directory is unwritable, the script creates and uses a
+#	     fallback directory within `/tmp/`.
+	
+#	7. ENSURE THE EXISTENCE OF THE INFORMIX PROCEDURE CALLED BY THIS SCRIPT	
+#
+#	    CREATE PROCEDURE printer_manager(job_number INT) 
+#		    RETURNING 	VARCHAR(20) AS printer_rule
+#		    ;
+#		    DEFINE		_printer_rule VARCHAR(10)
+#		    ; 	
+#		    SELECT		*
+#		    INTO		_printer_rule
+#		    FROM	(	SELECT		FIRST 1 def_value
+#					    FROM		job_data
+#					    WHERE		def_name[1,10] = 'GROUP NAME'
+#						    AND		def_value[1,3] = '#P:'
+#						    AND		def_number = job_number
+#					    ORDER BY	def_name ASC
+#				    )
+#		    ;
+#		    RETURN TRIM(_printer_rule[4,10])
+#		    ;
+#	    END PROCEDURE
+#	    ;
+#
+
+#===============================================================================
+#                   SECTION 3: COMMAND LINE MODES
+#===============================================================================
+# This script operates in different modes based on the command-line argument it receives.
+# It expects exactly one argument to determine its behavior.
+
+#   - `<file_path>` (Standard Processing Mode)
+#     Purpose: This is the primary operational mode, triggered by the preceding
+#              `intercept_ps2pdf.pl` script. It takes a full file path as an argument
+#              and executes the complete routing workflow.
+
+#   - `-connection` (Connection Test Mode)
+#     Purpose: A diagnostic mode to verify connectivity to the Informix database. It
+#              runs a simple query and reports success or failure to the console.
+
+#   - `-redo` (Reprocess Mode)
+#     Purpose: An administrative mode to re-process all files currently in the
+#              `$unprocessed_dir`. It iterates through each file and runs the full
+#              processing workflow on it.
+
+#   - `-pause` (Pause Processing Mode)
+#     Purpose: An administrative mode to gracefully pause the processing of new,
+#              incoming files. It sets a status flag that causes new files to be
+#              redirected to a `$paused_dir` instead of being processed.
+
+#   - `-continue` (Resume Processing Mode)
+#     Purpose: An administrative mode that resumes normal operation. It sets the status
+#              flag back to "online" and then re-processes all files that were
+#              accumulated in the `$paused_dir`.
+
+#   - `-help` (Help Mode)
+#     Purpose: Displays a summary of all available command-line arguments and their
+#              functions, then exits.
+
+#===============================================================================
+#           SECTION 4: USER-DEFINED CONFIGURATION VARIABLES
+#===============================================================================
+
+# 	1. DEFINING FILE PATHS & PERMISSIONS
+#	------------------------------------
+	my $working_directory = '/u/optifacts/share/latam_duties/printerManager';
+	#   Purpose: The single, top-level directory where all operational files and
+	#	         subdirectories for this script will reside. The script will attempt to create
+	#	         this directory if it does not exist. If creation fails or the directory is
+	#	         unwritable, the script will enter a fallback mode.
+	#   Example Value: '/u/optifacts/share/latam_duties/printerManager'
+		
+	my $config_file = '/u/optifacts/share/latam_duties/printerManager/printer_manager.cfg';
+	#   Purpose: Full path to the pipe-delimited rule configuration file. This path is
+	#            independent of the working directory and must be defined explicitly.
+	#   Example Value: '/u/optifacts/share/latam_duties/printerManager/printer_manager.cfg'
+
+	my $check_dir_4_lost_files = '';
+	#   Purpose: Specifies a directory (typically the output directory of the preceding
+	#            `intercept_ps2pdf.pl` script) to monitor for "lost" files. If a file
+	#            sits in this directory for too long, this script will move it to the
+	#            unprocessed folder for investigation. Set to an empty string to disable.
+	#   Example Value: '/u/optifacts/share/latam_duties/printerManager'
+		
+	my $default_permission = 0666;
+	#   Purpose: The octal permission (e.g., 0666) applied to any files or
+	#	         directories created by this script.
+	#   Example Value: 0666
+	
+# 	2. ADJUSTING BEHAVIORAL LOGIC
+#	------------------------------
+	my $verbose_logging = 0;
+	#   Purpose: A boolean flag (1 or 0) to enable or disable writing to the
+	#	         verbose log file. Allows for turning off detailed logging in production.
+	#   Example Value: 1
+		
+	my $wait_before_1st_try = 2;
+	#   Purpose: Seconds to wait before the script's first attempt to access the
+	#	         `$incoming_file`. Helps mitigate file-system race conditions.
+	#   Example Value: 3
+		
+	my $max_times_to_retry = 1;
+	#   Purpose: The number of additional attempts to find the file after the first one fails.
+	#	         - This value is mandatory for the retry logic to function.
+	#	         - The script will enforce a maximum value of 5. A value of 3 means 4 total attempts.
+	#   Example Value: 3
+	
+	my $seconds_between_retries = 5;
+	#   Purpose: Seconds to wait between each subsequent attempt if the file is not found.
+	#	         - This value is mandatory for the retry logic to function.
+	#	         - The script will enforce a minimum value of 5 and a maximum of 60.
+	#   Example Value: 10
+	
+	my $max_exec_time = 180;
+	#   Purpose: The maximum total time in seconds that a single file processing session
+	#            is allowed to run before it is automatically terminated. This prevents
+	#            a single job from hanging indefinitely.
+	#   Example Value: 300 (for 5 minutes)
+	
+	my $time_2_check_lost_files = 300; # in seconds
+	#   Purpose: The age in seconds a file must exceed in the `$check_dir_4_lost_files`
+	#            directory to be considered "lost" and moved to unprocessed.
+
+	my $save_processed_files = 0;
+	#   Purpose: A boolean flag (1 or 0) that controls whether successfully processed
+	#            files are archived to the `processed_dir` (if 1) or deleted (if 0).
+	#   Example Value: 1
+	
+# 	3. DEFINING COMMANDS AND REGEX PATTERNS
+#	---------------------------------------
+	my $job_regex_pattern = "qr/-(\d+)-/";
+	#   Purpose: A Perl regular expression used to extract the job number from the
+	#	         incoming filename. It must use a capture group `()` for the numerical value.
+	#   Example Value: qr/-(\d+)-/
+		
+	my $printer_check_command = "lpstat -v";
+	#   Purpose: A shell command that lists available system printers. The script
+	#	         will check this command's output to validate if a printer name exists.
+	#   Example Value: 'lpstat -v'
+		
+	my $command_for_printing = 'lp -d <printer_name> -o raw <file_path>';
+	#   Purpose: A template for the shell command used to print a file. Must
+	#	         include `<printer_name>` and `<file_path>` placeholders.
+	#   Example Value: 'lp -d <printer_name> -o raw <file_path>'
+		
+	my $ifx_procedure = 'CALL printer_manager(<job_number>)'; 
+	#   Purpose: The SQL statement to call the Informix stored procedure. Must
+	#	         include a `<job_number>` placeholder for the job number.
+	#   Example Value: 'EXECUTE PROCEDURE get_printer_rule(<job_number>)'
+
+#	4. VARIABLES FOR THE INFORMIX DATABASE CONNECTION
+#	-----------------------------------------------
+	my $db_user = 'user_credential';
+	#   Purpose: The username for the database connection.
+	#   Example Value: 'user_credential'
+		
+	my $db_password = 'user_credential';
+	#   Purpose: The password for the database connection.
+	#   Example Value: 'user_credential'
+	
+	my $db_name = 'optifacts';
+	#   Purpose: The name of the specific database to connect to within the Informix instance.
+	#   Example Value: 'optifacts'
+
+	my $informix_libs = "/usr/ids/lib:/usr/ids/lib/esql:/usr/informix/lib:/usr/informix/lib/esql";
+	#   Purpose: A colon-separated list of paths to the Informix client libraries,
+	# 	         used to construct $ENV{'LD_LIBRARY_PATH'}.
+	
+	$ENV{'INFORMIXDIR'} = '/usr/informix';
+	#   Purpose: Path to the Informix installation directory.
+	#   Example Value: '/usr/informix'
+		
+	$ENV{'INFORMIXSERVER'} = 'informix_server_name';
+	#   Purpose: The name of the default Informix server instance to connect to.
+	#   Example Value: 'informix_server_name'
+		
+	$ENV{'INFORMIXSQLHOSTS'} = '/usr/informix/etc/sqlhosts.01';
+	#   Purpose: Full path to the `sqlhosts` file defining server connection details.
+	#   Example Value: '/usr/informix/etc/sqlhosts.01'
+		
+	$ENV{'ONCONFIG'} = 'onconfig.01';
+	#   Purpose: The name of the configuration file for the Informix instance.
+	#   Example Value: 'onconfig.01'
+		
+	#$ENV{'LD_LIBRARY_PATH'}
+	#   Purpose: Will be constructed by the script's self-re-execution block.
+		
+#===============================================================================
+#              SECTION 5: DERIVED PATHS (INTERNAL LOGIC)
+#===============================================================================
+#	The following paths are determined automatically by the script at runtime.
+#	They are listed here for informational purposes and are not configured directly.
+#-------------------------------------------------------------------------------
+	
+# $success_log
+	#   Purpose: The log file for successfully completed transactions (MOVE or PRINT actions).
+	#   Path: $working_directory/printer_manager.log
+	
+# $failure_log
+	#   Purpose: A single, consolidated log file for all operational and critical errors.
+	#   Path: $working_directory/printer_manager_failures.log
+	
+# $verbose_log
+	#   Purpose: A log for detailed, step-by-step diagnostic information, controlled
+	#	         by the $verbose_logging flag. Useful for deep troubleshooting.
+	#   Path: $working_directory/printer_manager_verbose.log
+	
+# $in_process_dir
+	#   Purpose: A temporary holding directory for a file while it is being actively
+	#	         processed. This is crucial for the stale file recovery mechanism.
+	#   Path: $working_directory/in_process
+	
+# $unprocessed_dir
+	#   Purpose: A quarantine directory for files that encounter a fatal, unrecoverable
+	#	         error during processing, as well as for files that become stale.
+	#   Path: $working_directory/unprocessed
+
+# $paused_dir
+    #   Purpose: A directory to hold files that arrived while the system was in a paused state.
+    #   Path: $working_directory/paused
+	
+# $processed_dir
+	#   Purpose: If `$save_processed_files` is enabled, successfully processed files
+	#            are archived here.
+	#   Path: $working_directory/processed
+
+# $mode_file
+    #   Purpose: A status file (`online` or `paused`) that controls processing behavior.
+    #   Path: $working_directory/mode.cfg
+
+#===============================================================================
+#             SECTION 6: VERBOSE PROGRAM WORKFLOW & ERROR HANDLING
+#===============================================================================
+
+#	-------------------------------------------------------------------------------
+# 	PHASE 0. INITIAL STARTUP AND STRUCTURE VERIFICATION 
+
+#	0.1. The script will first check if the configured `$working_directory` exists.
+	# 	- If it does NOT exist, it will attempt to create it with `$default_permission`.
+	#	- If creation FAILS, it will set an internal "fallback mode" flag. All derived 
+	#	  paths will be automatically re-pointed to a temporary directory
+	#	  (e.g., `/tmp/printer_manager_fallback/`). The script will then 
+	#	  create this fallback structure. If this also fails, it will exit with a fatal error to the console (F20).
+	
+#	0.2. If `$working_directory` EXISTS, it will check if it is writable.
+	#	- If it IS writable, it proceeds normally, creating any missing subdirectories.
+	#	- If it is NOT writable, it will enter a "hybrid fallback mode":
+	#		- It checks if the independent `$config_file` exists and is readable.
+	#			a) If YES, it will use this config file but redirect all other derived 
+	#			   paths to the temporary fallback directory.
+	#			b) If NO, this is a fatal error. The script will attempt to log the error to the
+	#			   fallback `failure_log` and then exit (F21).
+	
+	# 0.3. The final derived paths (whether normal or fallback) are established and used for the remainder of the script's execution.
+
+#	-------------------------------------------------------------------------------
+#	PHASE 1. ENVIRONMENT SETUP (SELF-RE-EXECUTION) - CRITICAL STEP 
+
+# 	1.1. The script's first action is to ensure the correct environment for the
+	#	     Informix database driver. Because Perl's `use` statements are compiled before
+	#	     runtime code, environment variables like `LD_LIBRARY_PATH` must be set
+	#	     before the script's main logic begins. This self-re-execution is not
+	#	     optional; it is the only robust method to guarantee the `DBD::Informix`
+	#	     module can be loaded.
+	#
+# 	1.2. The script checks for a control environment variable (e.g., `$ENV{PERL_ENV_IS_CONFIGURED}`).
+	
+# 	1.3. **If the variable is NOT defined (first execution):**
+	#	     - The script sets the control variable: `$ENV{PERL_ENV_IS_CONFIGURED} = 1;`
+	#	     - It sets all required Informix environment variables (`$ENV{'INFORMIXDIR'}`, etc.).
+	#	     - It constructs the `$ENV{'LD_LIBRARY_PATH'}` string, prepending the Informix library paths.
+	#	     - It immediately calls `exec($^X, $0, @ARGV)` to restart itself. The new process
+	#	       inherits the fully configured environment.
+	
+	# 1.4. **If the variable IS defined (second, re-executed run):**
+	#	     - The script skips the setup block and proceeds directly to the main logic,
+	#	       where `use DBI;` can now be loaded successfully.
+
+#	-------------------------------------------------------------------------------
+#   PHASE 2. COMMAND-LINE ARGUMENT PARSING
+
+#   2.1. The script requires exactly one argument to determine its behavior. If the argument
+#        count is not one, it will display help text and exit.
+#
+#   2.2. The script checks the argument to determine the execution mode:
+#        - `-connection`: Enters Connection Test Mode.
+#        - `-redo`: Enters Redo Mode.
+#        - `-pause`: Enters Pause Mode.
+#        - `-continue`: Enters Continue Mode.
+#        - `-help`: Displays help text and exits.
+#        - `<file_path>`: Enters the default Standard Processing Mode.
+#        - Any other argument is invalid (log F3 and exit).
+
+#	-------------------------------------------------------------------------------
+#   PHASE 3. EXECUTION MODES
+
+#   3.1. Connection Test Mode (`-connection`):
+#        - The script attempts to connect to the Informix DB and execute the test query:
+#          `SELECT CURRENT :: DATETIME YEAR TO SECOND AS date_time FROM sysmaster:sysdual`
+#        - It prints a "Connection test succeeded, system current date time: <result>"
+#          or "Connection test FAILED" message to the console and exits. Failure is a fatal error (F4).
+
+#   3.2. Pause Mode (`-pause`):
+#        - The script changes the content of `$mode_file` to "paused", confirms to console, and exits.
+#          Failure to write is a fatal error (F5).
+
+#   3.3. Continue Mode (`-continue`):
+#        - The script first changes the content of `$mode_file` from "paused" to "online".
+#        - It then processes all files found in the `$paused_dir`, triggering the full Main Workflow for each.
+#        - The overall script timeout (`$max_exec_time`) applies to the entire session, but each
+#          individual file within the session gets its own sub-timeout to prevent one bad
+#          file from halting the entire batch.
+
+#   3.4. Redo Mode (`-redo`):
+#        - The script processes all files found in the `$unprocessed_dir`, triggering the full Main Workflow for each.
+
+#   3.5. Standard Processing Mode (`<file_path>`):
+#        - Reads `$mode_file`. If "paused", moves the incoming file to `$paused_dir`, logs the
+#          action in the success log with a "PAUSED" status, and exits.
+#        - If "online", proceeds to the file acquisition and main workflow.
+
+#	-------------------------------------------------------------------------------
+#   PHASE 4. NEW FILE ACQUISITION (Standard Mode Only)
+	
+# 	4.1. This phase only runs if the script was invoked with a file path.
+	
+# 	4.2. Retry Loop for File Existence:
+#	     - The script will first validate the retry variables (`$seconds_between_retries`, `$max_times_to_retry`).
+#	     - If both variables are not set with valid, non-zero values, the retry logic
+#          is skipped, and the script will only check for the file once.
+#	     - Otherwise, it will `sleep($wait_before_1st_try)` and then enter a loop, trying
+#          `1 + $max_times_to_retry` times to find the `$incoming_file_path`.
+#	     - On each failure, it logs a retry message to `$failure_log` (F22) and waits.
+#	     - If the file is still not found after all attempts, a final failure is logged to `$failure_log` (F23) and the script exits.
+	
+# 	4.3. If the file is found, the script proceeds to the Main Processing Workflow (Phase 5).
+
+#	-------------------------------------------------------------------------------
+#   PHASE 5. MAIN PROCESSING WORKFLOW (MODULAR SUBROUTINES)
+	
+# 	This entire workflow is executed for each file. The file being processed is
+# 	first moved from its source location to `$in_process_dir`. A script-wide `alarm` is
+#   set using `$max_exec_time`. A timeout triggers an LME (F6).
+	
+# 	5.1. Data Extraction:
+	# 	- Extract `$job_number` from the filename using `$job_regex_pattern`. On
+	#	  failure, execute LME (F7).
+	# 	- Extract `$file_format` ('ps' or 'pdf') from the filename's suffix. This
+	#	  value is used for matching in the configuration file. On failure, execute LME (F8).
+	
+# 	5.2. Rule Lookup (Database):
+	#	- Connect to the Informix database. On failure, LME (F9).
+	#	- Execute `$ifx_procedure` with `$job_number`. On failure, LME (F10).
+	#	- Fetch the single-column result into `$ifx_name_set`. If the result is null
+	#	  or empty, LME (F11).
+	#	- Disconnect from the database.
+	
+#	5.3. Rule Matching (Configuration File):
+	#	- Parse `$config_file`. If file cannot be read, LME (F12).
+	#	- Find the first line where the first column (`$name_set`) matches the
+	#	  database result (`$ifx_name_set`) AND the second column (`$format`) matches
+	#	  the `$file_format` extracted from the incoming filename.
+	#	- If a match is found, store the third column in `$printer_dir_rule`.
+	#	- If no match is found after reading the entire file, LME (F13).
+
+#	-------------------------------------------------------------------------------
+#   PHASE 6. ACTION EXECUTION
+
+# 	6.1. Determine Action Type (Directory or Printer):
+#	     - If `$printer_dir_rule` starts with a `/`, it is a directory path. Proceed to 6.2.
+#	     - Otherwise, it is a printer name. Proceed to 6.3.
+	
+# 	6.2. Directory Move Action:
+#	     - Verify the destination directory exists. If not, LME (F14).
+#	     - Move the file from `$in_process_dir` to the destination directory. On failure, LME (F15).
+#	     - If successful, proceed to Phase 7 with `ACTION="MOVE"` and `DESTINATION=$printer_dir_rule`.
+	
+# 	6.3. Print Action:
+#	     - The script will execute `$printer_check_command` safely without a shell (e.g., using
+#          `open()` with a pipe) to get a list of available printers. It will not
+#          interpret the command string through the shell.
+#	     - If the command fails, LME (F16).
+#	     - If `$printer_dir_rule` is not found in the output, LME (F17).
+#	     - The script will parse the `$command_for_printing` template. It will then
+#          execute the command using the safe, list form of `system()` (e.g.,
+#          `system('lp', '-d', $printer_dir_rule, ...)`) to prevent shell injection.
+#	     - On execution failure, LME (F18).
+#	     - If printing is successful, handle the processed file:
+#		   - If `$save_processed_files` is enabled, move the file from
+#		     `$in_process_dir` to `$processed_dir`. Log a non-fatal error on failure.
+#		   - If `$save_processed_files` is disabled, delete the file from `$in_process_dir`.
+#            Log a non-fatal error on failure.
+#	     - Proceed to Phase 7.
+
+#	-------------------------------------------------------------------------------
+#   PHASE 7. LOGGING
+	
+# 	7.1. A successful operation is logged to `$success_log` in the format:
+#	     `YYYY-MM-DD|HH:MM:SS|<original_filename>|<STATUS>|<ACTION>|<DESTINATION>`
+#        (STATUS can be PROCESSED, PAUSED, REPROCESSED_OK, or REPROCESSED_FAIL).
+# 	7.2. All errors are logged via the LME subroutine to `$failure_log` with an error code.
+
+#	-------------------------------------------------------------------------------
+#   PHASE 8. LOST AND STALE FILE CLEANUP
+
+#   8.1. This phase runs ONLY at the end of a Standard Processing Mode (`<file_path>`) execution.
+#        It does NOT run for any other command-line mode.
+#   8.2. Lost Files: If `$check_dir_4_lost_files` is configured, the script scans it.
+#        Any `.ps` or `.pdf` file older than `$time_2_check_lost_files` seconds is
+#        moved to `$unprocessed_dir` and logged (F19).
+#   8.3. Stale Files: The script scans the `$in_process_dir`. Any file older than
+#        `$stale_file_age_limit_seconds` is moved to `$unprocessed_dir` and logged (F24).
+
+#	-------------------------------------------------------------------------------
+#   PHASE 9. FINALIZATION
+
+# 	9.1. The script will close any open database connections if they are still open.
+# 	9.2. It will exit with a status code of 0 for success.
