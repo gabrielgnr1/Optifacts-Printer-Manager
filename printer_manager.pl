@@ -9,6 +9,13 @@
 #
 #   YYYY-MM-DD		PERSON				DESCRIPTION
 #   2025-07-24		Gabriel Ramalho		First version.
+#   2026-03-19		Gabriel Ramalho		Cfg file behavior correction. 
+#										4-level priority fallback for cfg rule matching:
+#										1) name_set + specific user
+#										2a) name_set + default user
+#										2b) default name_set + specific user
+#										3) default name_set + default user
+#										4) !F:13 -> unprocessed
 #
 #===============================================================================
 #              SECTION 1: PROGRAM CONTEXT, FUNCTIONALITY, AND AIM
@@ -88,12 +95,12 @@
 #			    export INFORMIXDIR="/usr/ids"
 #			    export PATH="/usr/ids/bin:${PATH}"
 #			    export LD_LIBRARY_PATH="/usr/informix/lib:/usr/informix/lib/esql:/usr/ids/lib:/usr/ids/lib/esql:${LD_LIBRARY_PATH}"
-#			    export INFORMIXSERVER="informix_server_name"
+#			    export INFORMIXSERVER="optifacts_01n"
 #			    export INFORMIXSQLHOSTS="/usr/informix/etc/sqlhosts.01"
 #			    export ONCONFIG="onconfig.01"
 #			    export DBD_INFORMIX_DATABASE="optifacts"
-#			    export DBD_INFORMIX_USERNAME="user_credential"
-#			    export DBD_INFORMIX_PASSWORD="user_credential"
+#			    export DBD_INFORMIX_USERNAME="optera"
+#			    export DBD_INFORMIX_PASSWORD="optera"
 #			    cpanm DBD::Informix
 #
 #	   B) EXTERNAL PROGRAMS:
@@ -271,15 +278,15 @@
 
 # 	3. DEFINING COMMANDS AND REGEX PATTERNS
 #	---------------------------------------
-	my $job_regex_pattern = qr/-(\d+?)-/;
+	my $job_regex_pattern = qr/-\d+-(\d+)-/;
 	#   Purpose: A Perl regular expression used to extract the job number from the
 	#	         incoming filename. It must use a capture group `()` for the numerical value.
 	#   Example Value: qr/-(\d+)-/
 
-	my $user_name_regex = qr/^(\D+?)(?=-)/;
+	my $user_name_regex = qr/^([^-]+?)(?=-)/;
 	#   Purpose: A Perl regular expression used to extract the user name from the
 	#	         incoming filename. It must use a capture group `()` for the user name.
-	#   Example Value: qr/_u-([^_]+)_/  (for a filename like '..._u-user_name_...')
+	#   Example Value: qr/_u-([^_]+)_/  (for a filename like '..._u-gramalho_...')
 		
 	my $printer_check_command = "lpstat -v";
 	#   Purpose: A shell command that lists available system printers. The script
@@ -298,13 +305,13 @@
 
 #	4. VARIABLES FOR THE INFORMIX DATABASE CONNECTION
 #	-----------------------------------------------
-	my $db_user = 'user_credential';
+	my $db_user = 'optera';
 	#   Purpose: The username for the database connection.
-	#   Example Value: 'user_credential'
+	#   Example Value: 'optera'
 		
-	my $db_password = 'user_credential';
+	my $db_password = 'essilor@1';
 	#   Purpose: The password for the database connection.
-	#   Example Value: 'user_credential'
+	#   Example Value: 'optera'
 	
 	my $db_name = 'optifacts';
 	#   Purpose: The name of the specific database to connect to within the Informix instance.
@@ -318,9 +325,9 @@
 	#   Purpose: Path to the Informix installation directory.
 	#   Example Value: '/usr/informix'
 		
-	my $informix_server = 'informix_server_name';
+	my $informix_server = 'optifacts_01n';
 	#   Purpose: The name of the default Informix server instance to connect to.
-	#   Example Value: 'informix_server_name'
+	#   Example Value: 'optifacts_01n'
 		
 	my $informix_sqlhosts = '/usr/informix/etc/sqlhosts.01';
 	#   Purpose: Full path to the `sqlhosts` file defining server connection details.
@@ -351,7 +358,8 @@
 # !F:10 - Connected to the database but failed to execute the stored procedure.
 # !F:11 - The stored procedure ran but returned no routing rule for the job number.
 # !F:12 - Could not open or read the printer_manager.cfg configuration file.
-# !F:13 - A rule was found in the database, but no matching rule for that file type exists in the config file.
+# !F:13 - A rule was found in the database, but no matching rule (specific user, default user, default name_set+user,
+#          or global default) was found in the config file for that name_set and file format.
 # !F:31 - Invalid line format in printer_manager.cfg (not exactly 4 columns).
 
 # --- Action & Movement Errors ---
@@ -406,7 +414,7 @@ unless ($ENV{PERL_ENV_IS_CONFIGURED}) {
 
     # Prepend Informix library paths to LD_LIBRARY_PATH.
     $ENV{'LD_LIBRARY_PATH'} = $informix_libs . (defined $ENV{'LD_LIBRARY_PATH'} ? ":$ENV{'LD_LIBRARY_PATH'}" : '');
-
+	
     # Re-execute the script. The new process inherits the correct environment.
     exec($^X, $0, @ARGV) or die "FATAL: Failed to re-execute script to set environment: $!";
 }
@@ -750,8 +758,15 @@ sub main_processing_workflow {
         $ifx_name_set =~ s/^\s+|\s+$//g;
         log_verbose("Retrieved name set from database: '$ifx_name_set'");
 
+        # Priority 1:  name_set_real  + user_real     (most specific)
+        # Priority 2a: name_set_real  + default user
+        # Priority 2b: default        + user_real
+        # Priority 3:  default        + default user  (least specific)
         my $specific_user_rule;
         my $default_user_rule;
+        my $default_nameset_user_rule;
+        my $global_default_rule;
+
         log_verbose("Reading config file '$config_file' to find match...");
         open(my $cfg_fh, '<', $config_file) or lme($current_file_path, '!F:12', "Could not open configuration file '$config_file': $OS_ERROR", $status_on_failure);
         
@@ -772,26 +787,44 @@ sub main_processing_workflow {
                 $col =~ s/^\s+|\s+$//g;
             }
 
-            # Check for a match on name set and format (case-insensitive)
-            if (lc($cfg_name_set) eq lc($ifx_name_set) && lc($cfg_format) eq lc($file_format)) {
-                # Check for a specific user match (case-insensitive)
-                if (defined $user_name && lc($cfg_user) eq lc($user_name)) {
-                    $specific_user_rule = $cfg_rule;
-                    log_verbose("Found specific user rule on line $.: '$cfg_rule'");
-                    last; # A specific user match is the highest priority, so we can stop looking.
-                }
-                # Check for a DEFAULT rule
-                elsif (lc($cfg_user) eq 'default') {
-                    $default_user_rule = $cfg_rule;
-                    log_verbose("Found DEFAULT user rule on line $.: '$cfg_rule'");
-                }
+            # Only consider lines whose format matches
+            next unless lc($cfg_format) eq lc($file_format);
+
+            my $is_real_nameset  = lc($cfg_name_set) eq lc($ifx_name_set);
+            my $is_default_ns    = lc($cfg_name_set) eq 'default';
+            my $is_specific_user = defined $user_name && lc($cfg_user) eq lc($user_name);
+            my $is_default_user  = lc($cfg_user) eq 'default';
+
+            # Priority 1: real name_set + specific user (stop searching immediately)
+            if ($is_real_nameset && $is_specific_user) {
+                $specific_user_rule = $cfg_rule;
+                log_verbose("Found priority-1 rule (name_set+user) on line $.: '$cfg_rule'");
+                last;
+            }
+            # Priority 2a: real name_set + default user
+            elsif ($is_real_nameset && $is_default_user) {
+                $default_user_rule = $cfg_rule;
+                log_verbose("Found priority-2a rule (name_set+default) on line $.: '$cfg_rule'");
+            }
+            # Priority 2b: default name_set + specific user
+            elsif ($is_default_ns && $is_specific_user) {
+                $default_nameset_user_rule = $cfg_rule;
+                log_verbose("Found priority-2b rule (default+user) on line $.: '$cfg_rule'");
+            }
+            # Priority 3: default name_set + default user
+            elsif ($is_default_ns && $is_default_user) {
+                $global_default_rule = $cfg_rule;
+                log_verbose("Found priority-3 rule (default+default) on line $.: '$cfg_rule'");
             }
         }
         close $cfg_fh;
 
-        my $printer_dir_rule = $specific_user_rule // $default_user_rule;
+        my $printer_dir_rule = $specific_user_rule
+                            // $default_user_rule
+                            // $default_nameset_user_rule
+                            // $global_default_rule;
 
-        lme($current_file_path, '!F:13', "Job '$job_number' found but no matching rule for user '".($user_name // 'N/A')."' or DEFAULT was found in config file for format '$file_format'", $status_on_failure) unless $printer_dir_rule;
+        lme($current_file_path, '!F:13', "Job '$job_number' (name_set='$ifx_name_set'): no matching rule found for user '" . ($user_name // 'N/A') . "' or any DEFAULT fallback in config file for format '$file_format'", $status_on_failure) unless $printer_dir_rule;
         log_verbose("Final matching rule selected: '$printer_dir_rule'");
 
         if ($printer_dir_rule =~ m{^/}) {
