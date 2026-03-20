@@ -66,9 +66,10 @@ The system is composed of three operational components:
                           ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    printer_manager.pl                           │
-│  ► Extracts the job number from the filename                    │
+│  ► Extracts job number and user name from the filename          │
 │  ► Queries the Informix DB for the job's name set               │
 │  ► Matches the name set against printer_manager.cfg             │
+│    using a 4-level priority rule                                │
 │  ► Routes the file: moves to a directory OR sends to printer    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -94,7 +95,6 @@ The system is composed of three operational components:
 | `intercept_ps2pdf.pl` | Perl script | Intercepts `.ps` files, converts to PDF, calls the router |
 | `printer_manager.pl` | Perl script | Core router: queries DB, matches config, dispatches files |
 | `printer_manager.cfg` | Config file | Pipe-delimited routing rules (name set → destination) |
-| `blueprint-v9.txt` | Documentation | Full technical specification and design document |
 
 ---
 
@@ -129,6 +129,8 @@ export DBD_INFORMIX_PASSWORD="user_credential"
 cpanm DBD::Informix
 ```
 
+> **Note:** The `DBD::Informix` test suite may fail on the `t09date.t` test due to date format mismatches between the test environment and the Informix server. This does not affect functionality. If this occurs, use `cpanm --force DBD::Informix` to force installation.
+
 #### External Programs
 
 - `ps2pdf` - for PostScript to PDF conversion (part of Ghostscript)
@@ -154,6 +156,11 @@ The printing service runs as a low-privilege user (typically `lp`). This user **
 ```bash
 chmod -R o+w /u/optifacts/share/latam_duties/printerManager
 chmod -R o+w /u/optifacts/share/worktickets
+```
+
+To add the printing user to the Optifacts group:
+```bash
+sudo /usr/sbin/usermod -aG optifacts lp
 ```
 
 ### 4. Database Procedure
@@ -190,6 +197,12 @@ PS2PDF=/path/to/intercept_ps2pdf.pl
 
 > To revert to standard behavior at any time, change `PS2PDF=` back to `/usr/bin/ps2pdf`.
 
+The **GROUP NAME** field in Optifacts menu **3-11-14-2** must be set with the `#P:` prefix for each job group that should be routed. For example, to route a group named `GNR_00`:
+
+```
+#P:GNR_00
+```
+
 ---
 
 ## Configuration
@@ -215,12 +228,12 @@ All configuration is in the **CONFIGURATION VARIABLES** section at the top of th
 | `$DIR_FILES_TO_EXEC_PDF` | Path | Directory prefix passed to the PDF external program |
 | `$VERBOSE_LOG` | 0 / 1 | Includes executed commands in the log when enabled |
 
-**Example:disabling PS file saving:**
+**Example — disabling PS file saving:**
 ```perl
 my @PS_DESTINATIONS = ();
 ```
 
-**Example:multiple PDF destinations:**
+**Example — multiple PDF destinations:**
 ```perl
 my @PDF_DESTINATIONS = (
     "/u/optifacts/share/latam_duties/printerManager/intercept_ps2pdf_output",
@@ -240,8 +253,8 @@ All configuration is in **Section 4** of the script.
 |---|---|---|
 | `$working_directory` | Top-level directory for all operational files | `/u/optifacts/share/latam_duties/printerManager` |
 | `$config_file` | Full path to `printer_manager.cfg` | `/u/optifacts/share/latam_duties/printerManager/printer_manager.cfg` |
-| `$check_dir_4_lost_files` | Directory to monitor for "lost" files (empty = disabled) | `/u/optifacts/share/latam_duties/printerManager` |
-| `$default_permission` | Octal permissions for created files/dirs | `0666` |
+| `$DIR_PERMISSIONS` | Octal permissions for directories created by this script | `0777` |
+| `$FILE_PERMISSIONS` | Octal permissions for files created by this script | `0666` |
 
 #### Behavioral Settings
 
@@ -251,15 +264,18 @@ All configuration is in **Section 4** of the script.
 | `$wait_before_1st_try` | Seconds to wait before first file access attempt | `2` |
 | `$max_times_to_retry` | Additional attempts to find the file after first failure (max 5) | `1` |
 | `$seconds_between_retries` | Seconds between retry attempts (min 5, max 60) | `5` |
-| `$max_exec_time` | Max total execution time in seconds before auto-termination | `180` |
-| `$time_2_check_lost_files` | File age in seconds to consider a file "lost" | `300` |
-| `$save_processed_files` | Archive processed files instead of deleting (1/0) | `0` |
+| `$max_exec_time` | Max total execution time in seconds before auto-termination | `300` |
+| `$recheck_original_dir` | Directory to monitor for "lost" files (empty string = disabled) | `/u/optifacts/.../intercept_ps2pdf_output` |
+| `$recheck_original_dir_file_age` | File age in seconds to consider a file "lost" | `360` |
+| `$stale_file_age_limit_seconds` | File age in seconds to consider a file in `in_process/` as stale | `360` |
+| `$save_processed_files` | Archive printed files instead of deleting (1/0) | `0` |
 
 #### Commands & Patterns
 
 | Variable | Description | Example |
 |---|---|---|
-| `$job_regex_pattern` | Regex to extract job number from filename | `qr/-(\d+)-/` |
+| `$job_regex_pattern` | Regex to extract job number from filename (2nd numeric block) | `qr/-\d+-(\d+)-/` |
+| `$user_name_regex` | Regex to extract user name from filename (text before first `-`) | `qr/^([^-]+?)(?=-)/` |
 | `$printer_check_command` | Command to list available printers | `lpstat -v` |
 | `$command_for_printing` | Print command template with placeholders | `lp -d <printer_name> -o raw <file_path>` |
 | `$ifx_procedure` | SQL to call the stored procedure | `CALL printer_manager(<job_number>)` |
@@ -272,10 +288,12 @@ All configuration is in **Section 4** of the script.
 | `$db_password` | Database password |
 | `$db_name` | Database name (e.g., `optifacts`) |
 | `$informix_libs` | Colon-separated Informix library paths for `LD_LIBRARY_PATH` |
-| `$ENV{'INFORMIXDIR'}` | Path to Informix installation directory |
-| `$ENV{'INFORMIXSERVER'}` | Informix server instance name |
-| `$ENV{'INFORMIXSQLHOSTS'}` | Path to the `sqlhosts` connection file |
-| `$ENV{'ONCONFIG'}` | Name of the Informix `onconfig` file |
+| `$informix_dir` | Path to Informix installation directory |
+| `$informix_server` | Informix server instance name |
+| `$informix_sqlhosts` | Path to the `sqlhosts` connection file |
+| `$informix_onconfig` | Name of the Informix `onconfig` file |
+
+> **Note:** The Informix environment variables (`INFORMIXDIR`, `INFORMIXSERVER`, etc.) are set automatically by the script's self-re-execution mechanism at startup. See [Self-Re-Execution Mechanism](#self-re-execution-mechanism) for details. Ensure that the `DBDATE` environment variable is consistent with the database server's date format — if the printing user's environment does not define it, set it explicitly in the re-execution block (e.g., `$ENV{'DBDATE'} = 'DMY4/'`).
 
 ---
 
@@ -296,18 +314,27 @@ A pipe-delimited (`|`) plain-text file that maps job name sets to routing destin
 3. Leading and trailing whitespace is ignored: `"  ABC  "` is read as `"ABC"`.
 4. Internal spaces are preserved: `"AAA BBB"` remains `"AAA BBB"`.
 5. Lines beginning with `#` are treated as comments.
-6. Rules with a specific `<user_name>` take **precedence** over `default` rules for the same name set.
-7. If `<DIRECTORY or PRINTER_NAME>` starts with `/`, the file is **moved to that directory**. Otherwise, it is treated as a **printer name**.
+6. Rule matching follows a **4-level priority order** (highest to lowest):
+   - **Priority 1:** `<name_set>` + `<specific_user>` — Most specific. Stops searching immediately.
+   - **Priority 2a:** `<name_set>` + `default` — Fallback for any user within a name set.
+   - **Priority 2b:** `default` + `<specific_user>` — Fallback for a specific user across all name sets.
+   - **Priority 3:** `default` + `default` — Global fallback when no other rule matches.
+   - **No match found** → File is moved to `unprocessed/` directory (error `!F:13`).
+7. The keyword `default` (case-insensitive) in the **1st column** acts as a wildcard that matches any `<name_set>` not explicitly defined in this file.
+8. The keyword `default` (case-insensitive) in the **2nd column** acts as a wildcard that matches any `<user_name>` not explicitly defined for that name set.
+9. If `<DIRECTORY or PRINTER_NAME>` starts with `/`, the file is **moved to that directory**. Otherwise, it is treated as a **printer name**.
 
 #### Example
 
 ```
-# Route job group ABCDE to different directories based on user
-ABCDE      | default  | PDF | /u/optifacts/share/latam_duties/printerManager/dir_1
-ABCDE      | user_name | PDF | /u/optifacts/share/latam_duties/printerManager/dir_2
+# Full 4-level priority example for name set GNR_00
+GNR_00  | gramalho | PDF | /u/optifacts/share/latam_duties/printerManager/dir_1   # Priority 1
+GNR_00  | default  | PDF | /u/optifacts/share/latam_duties/printerManager/dir_2   # Priority 2a
+default | gramalho | PDF | /u/optifacts/share/latam_duties/printerManager/dir_3   # Priority 2b
+default | default  | PDF | /u/optifacts/share/latam_duties/printerManager/dir_4   # Priority 3
 
-# Route a special group to a physical printer (PS format)
-# MYGROUP  | default  | PS  | printer_lax
+# Route a specific group to a physical printer (PS format)
+# MYGROUP | default | PS | printer_lax
 ```
 
 ---
@@ -319,22 +346,22 @@ ABCDE      | user_name | PDF | /u/optifacts/share/latam_duties/printerManager/di
 | Argument | Mode | Description |
 |---|---|---|
 | `<file_path>` | **Standard Processing** | Primary mode. Routes the given file to its destination. Called automatically by `intercept_ps2pdf.pl`. |
-| `-connection` | **Connection Test** | Tests the Informix database connection and prints the result to the console. |
+| `-connect` | **Connection Test** | Tests the Informix database connection and checks required Perl modules. Prints the result to the console. |
 | `-pause` | **Pause** | Pauses processing. Incoming files are held in the `paused/` directory instead of being routed. |
-| `-continue` | **Resume** | Resumes normal operation and reprocesses all files accumulated while paused. |
-| `-redo` | **Reprocess** | Reprocesses all files currently in the `unprocessed/` quarantine directory. |
+| `-resume` | **Resume** | Resumes normal operation and reprocesses all files accumulated while paused. |
+| `-redo` | **Reprocess** | Scans for lost/stale files and reprocesses all files currently in the `unprocessed/` directory. |
 | `-help` | **Help** | Displays a summary of all available modes and exits. |
 
 **Usage examples:**
 ```bash
 # Test database connectivity
-printer_manager.pl -connection
+printer_manager.pl -connect
 
 # Pause the system before maintenance
 printer_manager.pl -pause
 
 # Resume and process any backlogged files
-printer_manager.pl -continue
+printer_manager.pl -resume
 
 # Reprocess files that previously failed
 printer_manager.pl -redo
@@ -366,12 +393,12 @@ When `printer_manager.pl` starts, it evaluates `$working_directory` in two steps
 **If the directory does not exist:**
 - The script attempts to create it.
 - If creation fails, it falls back to `/tmp/printer_manager_fallback/` for all logs and subdirectories.
-- If the fallback also cannot be created, the script exits with fatal error `F20`.
+- If the fallback also cannot be created, the script exits with fatal error `!F:20`.
 
 **If the directory exists but is not writable (hybrid fallback):**
 - The script checks if `$config_file` is readable.
   - If **yes**: uses the real config file for routing rules, but redirects all logs and subdirectories to `/tmp/printer_manager_fallback/`.
-  - If **no**: fatal error `F21`. The script logs to the fallback path and exits.
+  - If **no**: fatal error `!F:21`. The script logs to the fallback path and exits.
 
 This means the system can still route files correctly even if the working directory has permission issues, as long as the config file is accessible.
 
@@ -421,40 +448,71 @@ YYYY-MM-DD|HH:MM:SS|<filename>|<STATUS>|<ACTION>|<DESTINATION>
 
 ### `printer_manager_failures.log`
 
-All errors with their corresponding error codes (F1–F24). See the [Error Codes](#error-codes) section below.
+All errors with their corresponding error codes. See the [Error Codes](#error-codes) section below.
 
 ---
 
 ## Error Codes
 
+### Startup & Environment Errors
+
 | Code | Description |
 |---|---|
-| F1 | Missing required Perl module at startup |
-| F3 | Invalid command-line argument |
-| F4 | Database connection test failed |
-| F5 | Failed to write to the mode file |
-| F6 | Execution timeout (`$max_exec_time` exceeded) |
-| F7 | Failed to extract job number from filename |
-| F8 | Failed to extract file format from filename |
-| F9 | Failed to connect to Informix database |
-| F10 | Failed to execute the stored procedure |
-| F11 | Stored procedure returned null or empty result |
-| F12 | Configuration file could not be read |
-| F13 | No matching rule found in configuration file |
-| F14 | Destination directory does not exist |
-| F15 | Failed to move file to destination directory |
-| F16 | Printer check command failed |
-| F17 | Printer name not found in `lpstat` output |
-| F18 | Print command execution failed |
-| F19 | "Lost" file detected and moved to unprocessed |
-| F20 | Fatal: could not create working directory or fallback |
-| F21 | Fatal: working directory unwritable and config file unreadable |
-| F22 | File not found on retry attempt |
-| F23 | File not found after all retry attempts exhausted |
-| F24 | Stale file detected in `in_process/` and moved to unprocessed |
+| `!F:1` | Missing required Perl module at startup |
+| `!F:3` | Invalid command-line argument |
+| `!F:4` | Database connection test failed (`-connect` mode) |
+| `!F:5` | Failed to write to the `mode.cfg` file |
+| `!F:20` | Fatal: could not create working directory or fallback |
+| `!F:21` | Fatal: working directory unwritable and config file unreadable |
+
+### File Processing Errors
+
+| Code | Description |
+|---|---|
+| `!F:6` | Execution timeout (`$max_exec_time` exceeded) |
+| `!F:7` | Failed to extract job number from filename using the configured regex |
+| `!F:8` | File does not have a valid `.ps` or `.pdf` extension |
+| `!F:9` | Failed to connect to the Informix database |
+| `!F:10` | Connected to database but failed to execute the stored procedure |
+| `!F:11` | Stored procedure returned null or empty result (job has no name set) |
+| `!F:12` | Configuration file could not be opened or read |
+| `!F:13` | No matching rule found in config file (specific user, default user, default name_set+user, or global default all tried) |
+| `!F:31` | Invalid line format in `printer_manager.cfg` (expected 4 columns) |
+
+### Action & Movement Errors
+
+| Code | Description |
+|---|---|
+| `!F:14` | Destination directory does not exist and could not be created |
+| `!F:14A` | Destination directory was created but permissions could not be set |
+| `!F:15` | Failed to move file to its final destination directory |
+| `!F:16` | Failed to execute the printer check command (e.g., `lpstat -v`) |
+| `!F:17` | Printer name from config not found in system printer list |
+| `!F:18` | Print command execution failed |
+| `!F:25` | After successful print, failed to archive file to `processed/` directory |
+| `!F:26` | After successful print, failed to delete the file |
+| `!F:27` | Failed to move a file during cleanup phase |
+| `!F:28` | Failed to move incoming file to `in_process/` directory |
+| `!F:29` | Failed to read the `mode.cfg` file to check paused state |
+| `!F:30` | System is paused but failed to move file to `paused/` directory |
+
+### File Acquisition Errors
+
+| Code | Description |
+|---|---|
+| `!F:22` | File not found on a retry attempt |
+| `!F:23` | File not found after all retry attempts exhausted |
+
+### Cleanup Phase Errors
+
+| Code | Description |
+|---|---|
+| `!F:19` | "Lost" file detected in `$recheck_original_dir` and moved to `unprocessed/` |
+| `!F:24` | Stale file detected in `in_process/` and moved to `unprocessed/` |
 
 ---
 
 ## Authors
 
-- Gabriel Ramalho - First version (2025-07-24)
+- Gabriel Ramalho — First version (2025-07-24)
+- Gabriel Ramalho — 4-level priority fallback for cfg rule matching (2026-03-19)
